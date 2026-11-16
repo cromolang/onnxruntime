@@ -1,0 +1,5 @@
+*.exe
+*.pdb
+*.dll
+*.so*
+examples/linear/linear

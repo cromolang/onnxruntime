@@ -1,0 +1,13 @@
+import onnxruntime
+
+i32 main() {
+    println("ONNX Runtime {}", onnxruntime.version())
+    onnxruntime.Session model = onnxruntime.load("linear.onnx")
+    println("inputs {:?}, outputs {:?}", model.inputNames(), model.outputNames())
+    list<f32> x = [1.0, 2.0, 3.0, 4.0]
+    list<onnxruntime.Tensor> out = model.run([onnxruntime.Tensor([1, 4], x)])
+    for (onnxruntime.Tensor t in out) {
+        println("{:?} {:?}", t.shape, t.data)
+    }
+    ret 0
+}

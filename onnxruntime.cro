@@ -1,0 +1,344 @@
+// ONNX Runtime for Cromo: a 'Session' reads a model in the ONNX format and runs it on
+// tensors of numbers, on the processor. The library of ONNX Runtime comes with the
+// package, for Windows and for Linux on x86-64: cromo downloads it by the lines native
+// of cromo.mod, and puts it next to the executable.
+//
+// '''
+// import onnxruntime
+//
+// onnxruntime.Session model = onnxruntime.load("digits.onnx")
+// onnxruntime.Tensor image = onnxruntime.Tensor([1, 1, 28, 28], pixels)
+// list<onnxruntime.Tensor> scores = model.run([image])
+// println("{:?}", scores[0].data)
+// '''
+//
+// In this version the tensors are of f32, the type of most models: a model with an
+// input or an output of another type is refused, with its name.
+
+// The C API of ONNX Runtime is a table of functions (OrtApi), which OrtGetApiBase
+// gives: each is called through its address, by its place in the table, with callC
+// (D552). The places are those of onnxruntime_c_api.h, which only grows at its end;
+// the version asked, 17, is that of ONNX Runtime 1.17, so any later library has them.
+import std.fs
+import unsafe
+
+extern "onnxruntime" {
+    addr OrtGetApiBase()
+}
+
+const u32 apiVersion = 17
+
+// The places in OrtApi.
+const i64 getErrorMessage = 2
+const i64 createEnv = 3
+const i64 createSessionFromArray = 8
+const i64 runSession = 9
+const i64 createSessionOptions = 10
+const i64 setIntraOpNumThreads = 24
+const i64 sessionGetInputCount = 30
+const i64 sessionGetOutputCount = 31
+const i64 sessionGetInputName = 36
+const i64 sessionGetOutputName = 37
+const i64 createTensorWithData = 49
+const i64 getTensorMutableData = 51
+const i64 getTensorElementType = 60
+const i64 getDimensionsCount = 61
+const i64 getDimensions = 62
+const i64 getTensorShapeElementCount = 64
+const i64 getTensorTypeAndShape = 65
+const i64 createCpuMemoryInfo = 69
+const i64 allocatorFree = 76
+const i64 getAllocator = 78
+const i64 releaseEnv = 92
+const i64 releaseStatus = 93
+const i64 releaseMemoryInfo = 94
+const i64 releaseSession = 95
+const i64 releaseValue = 96
+const i64 releaseTensorInfo = 99
+const i64 releaseSessionOptions = 100
+
+const i32 elementFloat = 1  // ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+
+// The function at a place of the table.
+addr entry(addr api, i64 place) {
+    ret take<addr>(offset(api, place * 8))
+}
+
+// A string of C, ended by a zero.
+string cText(addr text) {
+    i64 n = 0
+    for (take<u8>(offset(text, n)) != 0) {
+        n++
+    }
+    ret string(text, n)
+}
+
+// A copy of a text as a string of C, to free.
+addr cCopy(string text) {
+    addr copy = alloc(text.len() + 1)
+    for (i64 i = 0; i < text.len(); i++) {
+        put<u8>(offset(copy, i), text[i])
+    }
+    put<u8>(offset(copy, text.len()), 0)
+    ret copy
+}
+
+// A status that is not null is an error: its message becomes an exception.
+void check(addr api, addr status) {
+    addr none
+    if (status == none) {
+        ret
+    }
+    string message = cText(callC<addr>(entry(api, getErrorMessage), status))
+    callC<void>(entry(api, releaseStatus), status)
+    throw Error(format("ONNX Runtime: {}", message))
+}
+
+// The version of the library of ONNX Runtime in use, as "1.32.0".
+public string version() {
+    addr base = OrtGetApiBase()
+    ret cText(callC<addr>(take<addr>(offset(base, 8))))
+}
+
+// Numbers with a shape: 'shape' has the size of each dimension, as [1, 3, 224, 224],
+// and 'data' the numbers, row after row, as many as the sizes multiplied.
+public struct Tensor {
+    public list<i64> shape
+    public list<f32> data
+
+    // A tensor of a shape with its numbers. A panic when the numbers are not as many as
+    // the shape says.
+    public Tensor(list<i64> sizes, list<f32> numbers) {
+        i64 count = 1
+        for (i64 size in sizes) {
+            count = count * size
+        }
+        if (count != numbers.len()) {
+            panic(format("a tensor of the shape {:?} has {} numbers, found {}", sizes, count, numbers.len()))
+        }
+        shape = sizes
+        data = numbers
+    }
+}
+
+// A model, ready to run. It is not copied, only moved, and frees what ONNX Runtime
+// made for it when it ends. One session can be run by more threads at the same time.
+public struct Session {
+    addr api
+    addr env
+    addr session
+    addr memory  // where the tensors of the program are: the memory of the processor
+    list<string> inputs
+    list<string> outputs
+
+    // Reads a model from the bytes of a file in the ONNX format, as 'embed' and
+    // 'fs.readBytes' give them. Throws an 'Error' with what ONNX Runtime says when they
+    // are not a model that it can run.
+    public Session(list<u8> model) {
+        addr none
+        addr base = OrtGetApiBase()
+        api = callC<addr>(take<addr>(base), apiVersion)
+        if (api == none) {
+            throw Error(format("ONNX Runtime {} is older than 1.17, which this package needs", version()))
+        }
+        addr slot = alloc(8)
+        addr bytes = alloc(model.len() > 0 ? model.len() : 1)
+        addr options
+        addr name = cCopy("cromo")
+        try {
+            put<addr>(slot, none)
+            check(api, callC<addr>(entry(api, createEnv), i32(2), name, slot))  // 2: the warnings and the errors
+            env = take<addr>(slot)
+            check(api, callC<addr>(entry(api, createCpuMemoryInfo), i32(1), i32(0), slot))
+            memory = take<addr>(slot)
+            check(api, callC<addr>(entry(api, createSessionOptions), slot))
+            options = take<addr>(slot)
+            for (i64 i = 0; i < model.len(); i++) {
+                put<u8>(offset(bytes, i), model[i])
+            }
+            put<addr>(slot, none)
+            check(api, callC<addr>(entry(api, createSessionFromArray), env, bytes, model.len(), options, slot))
+            session = take<addr>(slot)
+            inputs = names(sessionGetInputCount, sessionGetInputName)
+            outputs = names(sessionGetOutputCount, sessionGetOutputName)
+        } finally {
+            if (options != none) {
+                callC<void>(entry(api, releaseSessionOptions), options)
+            }
+            free(name)
+            free(bytes)
+            free(slot)
+        }
+    }
+
+    ~Session() {
+        addr none
+        if (session != none) {
+            callC<void>(entry(api, releaseSession), session)
+        }
+        if (memory != none) {
+            callC<void>(entry(api, releaseMemoryInfo), memory)
+        }
+        if (env != none) {
+            callC<void>(entry(api, releaseEnv), env)
+        }
+    }
+
+    // The names of the inputs or of the outputs of the model, in their order.
+    list<string> names(i64 counter, i64 namer) const {
+        list<string> found
+        addr slot = alloc(8)
+        try {
+            i64 count = 0
+            check(api, callC<addr>(entry(api, counter), session, ref count))
+            check(api, callC<addr>(entry(api, getAllocator), slot))
+            addr allocator = take<addr>(slot)
+            for (i64 i = 0; i < count; i++) {
+                check(api, callC<addr>(entry(api, namer), session, i, allocator, slot))
+                addr name = take<addr>(slot)
+                found.add(cText(name))
+                check(api, callC<addr>(entry(api, allocatorFree), allocator, name))
+            }
+        } finally {
+            free(slot)
+        }
+        ret found
+    }
+
+    // The names of the inputs of the model, in the order in which 'run' takes them.
+    public list<string> inputNames() const {
+        ret inputs
+    }
+
+    // The names of the outputs of the model, in the order in which 'run' gives them.
+    public list<string> outputNames() const {
+        ret outputs
+    }
+
+    // Runs the model on its inputs, one tensor for each, in the order of 'inputNames',
+    // and gives its outputs, in the order of 'outputNames'. Throws an 'Error' when the
+    // inputs are not as many as the model has, when ONNX Runtime refuses them, as for a
+    // shape that is not that of the model, and when an output is not of f32.
+    public list<Tensor> run(list<Tensor> given) const {
+        if (given.len() != inputs.len()) {
+            throw Error(format("the model has {} inputs, {:?}, but {} were given", inputs.len(), inputs, given.len()))
+        }
+        addr none
+        i64 ins = inputs.len()
+        i64 outs = outputs.len()
+        // Four tables of addresses: the names and the values of the inputs, the names
+        // and the values of the outputs. What they point to is freed at the end.
+        addr inNames = table(ins)
+        addr inValues = table(ins)
+        addr outNames = table(outs)
+        addr outValues = table(outs)
+        addr buffers = table(ins * 2)  // the numbers and the shape of each input
+        addr slot = alloc(8)
+        list<Tensor> results
+        try {
+            for (i64 i = 0; i < ins; i++) {
+                put<addr>(offset(inNames, i * 8), cCopy(inputs[i]))
+                i64 count = given[i].data.len()
+                i64 dimensions = given[i].shape.len()
+                addr numbers = alloc(count > 0 ? count * 4 : 4)
+                put<addr>(offset(buffers, i * 16), numbers)
+                for (i64 k = 0; k < count; k++) {
+                    put<f32>(offset(numbers, k * 4), given[i].data[k])
+                }
+                addr shape = alloc(dimensions > 0 ? dimensions * 8 : 8)
+                put<addr>(offset(buffers, i * 16 + 8), shape)
+                for (i64 k = 0; k < dimensions; k++) {
+                    put<i64>(offset(shape, k * 8), given[i].shape[k])
+                }
+                put<addr>(slot, none)
+                check(api, callC<addr>(entry(api, createTensorWithData), memory, numbers, count * 4, shape, dimensions, elementFloat, slot))
+                put<addr>(offset(inValues, i * 8), take<addr>(slot))
+            }
+            for (i64 i = 0; i < outs; i++) {
+                put<addr>(offset(outNames, i * 8), cCopy(outputs[i]))
+            }
+            check(api, callC<addr>(entry(api, runSession), session, none, inNames, inValues, ins, outNames, outs, outValues))
+            for (i64 i = 0; i < outs; i++) {
+                results.add(tensorOf(take<addr>(offset(outValues, i * 8)), outputs[i], slot))
+            }
+        } finally {
+            release(inValues, ins, true)
+            release(outValues, outs, true)
+            release(inNames, ins, false)
+            release(outNames, outs, false)
+            release(buffers, ins * 2, false)
+            free(slot)
+        }
+        ret results
+    }
+
+    // A table of 'count' addresses, all null.
+    addr table(i64 count) const {
+        addr made = alloc(count > 0 ? count * 8 : 8)
+        addr none
+        for (i64 i = 0; i < count; i++) {
+            put<addr>(offset(made, i * 8), none)
+        }
+        ret made
+    }
+
+    // Frees a table and what its addresses point to: values of ONNX Runtime, or memory
+    // of this module.
+    void release(addr made, i64 count, bool values) const {
+        addr none
+        for (i64 i = 0; i < count; i++) {
+            addr item = take<addr>(offset(made, i * 8))
+            if (item != none && values) {
+                callC<void>(entry(api, releaseValue), item)
+            } else if (item != none) {
+                free(item)
+            }
+        }
+        free(made)
+    }
+
+    // A copy of a value of ONNX Runtime, a tensor of f32, with its shape.
+    Tensor tensorOf(addr value, string name, addr slot) const {
+        addr none
+        list<i64> shape
+        list<f32> data
+        put<addr>(slot, none)
+        check(api, callC<addr>(entry(api, getTensorTypeAndShape), value, slot))
+        addr info = take<addr>(slot)
+        addr sizes
+        try {
+            i32 element = 0
+            check(api, callC<addr>(entry(api, getTensorElementType), info, ref element))
+            if (element != elementFloat) {
+                throw Error(format("the output {} of the model is not of f32: this version reads only those", name))
+            }
+            i64 dimensions = 0
+            check(api, callC<addr>(entry(api, getDimensionsCount), info, ref dimensions))
+            sizes = alloc(dimensions > 0 ? dimensions * 8 : 8)
+            check(api, callC<addr>(entry(api, getDimensions), info, sizes, dimensions))
+            for (i64 k = 0; k < dimensions; k++) {
+                shape.add(take<i64>(offset(sizes, k * 8)))
+            }
+            i64 count = 0
+            check(api, callC<addr>(entry(api, getTensorShapeElementCount), info, ref count))
+            check(api, callC<addr>(entry(api, getTensorMutableData), value, slot))
+            addr numbers = take<addr>(slot)
+            data.reserve(count)
+            for (i64 k = 0; k < count; k++) {
+                data.add(take<f32>(offset(numbers, k * 4)))
+            }
+        } finally {
+            if (sizes != none) {
+                free(sizes)
+            }
+            callC<void>(entry(api, releaseTensorInfo), info)
+        }
+        ret Tensor(shape, data)
+    }
+}
+
+// Reads a model from a file in the ONNX format. Throws an 'Error' when the file cannot
+// be read or is not a model that ONNX Runtime can run.
+public Session load(string path) {
+    ret Session(fs.readBytes(path))
+}
